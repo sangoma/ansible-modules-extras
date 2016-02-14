@@ -103,7 +103,6 @@ description: Install packages based on package.json using the npm installed with
 '''
 
 import os
-
 try:
     import json
 except ImportError:
@@ -132,13 +131,14 @@ class Npm(object):
 
         if kwargs['version']:
             self.name_version = self.name + '@' + self.version
+            self.reqversion = kwargs['version']
         else:
             self.name_version = self.name
+            self.reqversion = None
 
     def _exec(self, args, run_in_check_mode=False, check_rc=True):
         if not self.module.check_mode or (self.module.check_mode and run_in_check_mode):
             cmd = self.executable + args
-
             if self.glbl:
                 cmd.append('--global')
             if self.production:
@@ -166,24 +166,57 @@ class Npm(object):
         return ''
 
     def list(self):
-        cmd = ['list', '--json']
+        """Gather a list of installed and missing
+        node modules. Try first to use 'npm list' and then
+        fallback to 'npm outdated' because 'list' does not
+        list devDependencies (not even with a --dev) when the
+        project consists of a single package.json and nothing
+        has been installed at all yet (that seems like a bug),
+        but npm outdated does list them ...
+        """
+        installed = set()
+        missing = set()
 
-        installed = list()
-        missing = list()
+        # Use list first
+        cmd = ['list', '--json']
         data = json.loads(self._exec(cmd, True, False))
         if 'dependencies' in data:
             for dep in data['dependencies']:
-                if 'missing' in data['dependencies'][dep] and data['dependencies'][dep]['missing']:
-                    missing.append(dep)
-                elif 'invalid' in data['dependencies'][dep] and data['dependencies'][dep]['invalid']:
-                    missing.append(dep)
+                depinfo = data['dependencies'][dep]
+                if ('missing' in depinfo
+                   and depinfo['missing']):
+                    missing.add(dep)
+                elif ('invalid' in depinfo
+                      and depinfo['invalid']):
+                    missing.add(dep)
+                elif (self.reqversion
+                      and 'version' in depinfo
+                      and depinfo['version'] != self.reqversion):
+                    missing.add(dep)
                 else:
-                    installed.append(dep)
-            if self.name and self.name not in installed:
-                missing.append(self.name)
-        #Named dependency not installed
-        else:
-            missing.append(self.name)
+                    installed.add(dep)
+
+        # Now try using 'outdated' because list does not seem to list missing
+        # dev dependencies at all (npm version 3.7.2) even if --dev is
+        # specified (though should not be needed unless you only want
+        # dev dependencies listed). If this bug is ever fixed on npm, this
+        # can be removed.
+        try:
+            cmd = ['outdated', '--json']
+            data = json.loads(self._exec(cmd, True, False))
+            installed.update([pkg for pkg, info in data.items()
+                              if pkg not in missing
+                              and 'location' in info
+                              and info['location']])
+            missing.update([pkg for pkg, info
+                            in data.items()
+                            if pkg not in installed
+                            and 'current' not in info])
+        except ValueError:
+            pass
+
+        if self.name and self.name not in installed:
+            missing.add(self.name)
 
         return installed, missing
 
@@ -197,15 +230,52 @@ class Npm(object):
         return self._exec(['uninstall'])
 
     def list_outdated(self):
-        outdated = list()
-        data = self._exec(['outdated'], True, False)
-        for dep in data.splitlines():
-            if dep:
-                # node.js v0.10.22 changed the `npm outdated` module separator
-                # from "@" to " ". Split on both for backwards compatibility.
-                pkg, other = re.split('\s|@', dep, 1)
-                outdated.append(pkg)
+        """Try to get a reliable list of outdated modules.
+        It seems older npm versions didn't have the --json
+        option for the outdated command. Original code in
+        this function was using a regex, so we try to get
+        the list with --json first and if it fails fallback
+        to the old method of using a regular expression on
+        the output. Note that method doesn't support at all
+        checking the wanted version so any module that is
+        spit out in stdout will be added regardless of whether
+        the module is actually up to the latest specified
+        version in package.json"""
+        outdated = set()
+        cmd = ['outdated', '--json']
 
+        def _pkg_is_outdated(pkg, info):
+            if 'current' not in info:
+                return False
+            if self.reqversion:
+                # If installed version is different
+                # than required version, needs an update
+                if info['current'] != self.reqversion:
+                    return True
+                else:
+                    return False
+            if info['current'] != info['wanted']:
+                return True
+            return False
+
+        try:
+            data = json.loads(self._exec(cmd, True, False))
+            outdated = set([pkg for pkg, info
+                            in data.items()
+                            if _pkg_is_outdated(pkg, info)])
+        except ValueError:
+            data = self._exec(cmd[0:1], True, False)
+            for dep in data.splitlines():
+                if dep:
+                    # node.js v0.10.22 changed the `npm outdated` module
+                    # separator from "@" to " ". Split on both for
+                    # backwards compatibility.
+                    pkg, other = re.split('\s|@', dep, 1)
+                    # Try to detect and skip if a header is present
+                    if (pkg.lower() == 'package'
+                       and 'current' in other.lower()):
+                        continue
+                    outdated.add(pkg)
         return outdated
 
 
@@ -240,24 +310,41 @@ def main():
         module.fail_json(msg='path must be specified when not using global')
     if state == 'absent' and not name:
         module.fail_json(msg='uninstalling a package is only available for named packages')
+    if state == 'latest' and version:
+        module.fail_json(msg='when requesting latest you cannot request a specific version')
+    if state == 'absent' and version:
+        module.fail_json(msg='when uninstalling packages you cannot request a specific version')
 
     npm = Npm(module, name=name, path=path, version=version, glbl=glbl, production=production, \
               executable=executable, registry=registry, ignore_scripts=ignore_scripts)
 
     changed = False
+    installed, missing = npm.list()
     if state == 'present':
-        installed, missing = npm.list()
-        if len(missing):
+        # If there are missing modules
+        # or no modules at all, attempt
+        # an install ...
+        if len(missing) or not len(installed):
             changed = True
             npm.install()
     elif state == 'latest':
-        installed, missing = npm.list()
         outdated = npm.list_outdated()
-        if len(missing) or len(outdated):
+
+        # 'npm update <package>' does not do anything
+        # if <package> is not installed in the first place
+        # so if nothing is installed or the specific
+        # package name specified is not installed
+        # perform an install rather than an update
+        if (not len(installed)
+            or (name
+                and name not in installed)):
+            changed = True
+            npm.install()
+        elif len(missing) or len(outdated):
             changed = True
             npm.update()
-    else: #absent
-        installed, missing = npm.list()
+    else:
+        # absent ...
         if name in installed:
             changed = True
             npm.uninstall()

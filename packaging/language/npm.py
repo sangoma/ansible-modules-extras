@@ -102,6 +102,62 @@ description: Install packages based on package.json using the npm installed with
 - npm: path=/app/location executable=/opt/nvm/v0.10.1/bin/npm state=present
 '''
 
+TESTING = '''
+# Standalone global with a specific package
+        present, specific version should be installed
+                "name=browserify global=true version=12.0.1 state=present"
+
+        run again, state should be unmodified
+                "name=browserify global=true version=12.0.1 state=present"
+
+        present with new version, already installed package should be upgraded
+                "name=browserify global=true version=12.0.2 state=present"
+
+        latest, package should be upgraded to latest
+                "name=browserify global=true state=latest"
+
+        absent, package should be removed
+                "name=browserify global=true state=absent"
+
+        latest, from the start latest version should be installed
+                "name=browserify global=true state=latest"
+
+        run again, state should be unmodified
+                "name=browserify global=true state=latest"
+
+        run with same version as latest, should report no changes
+                "name=browserify global=true version=13.0.0 state=present"
+
+        try to run absent with a version, should report an error
+                "name=browserify global=true version=13.0.0 state=absent"
+
+        try to run latest with a version, should report an error
+                "name=browserify global=true version=13.0.0 state=latest"
+
+        absent (again for cleanup), package should be removed
+                "name=browserify global=true state=absent"
+
+        present, no specific version, latest should be installed
+                "name=browserify global=true state=present"
+
+        run again, state should be unmodified
+                "name=browserify global=true state=present"
+
+        absent (again for cleanup), package should be removed
+                "name=browserify global=true state=absent"
+
+        absent, state should be unmodified
+                "name=browserify global=true state=absent"
+
+# Standalone in directory
+        same tests as in global, but path=some-dir/ instead of global=true, packages should be installed locally
+
+# Project with package.json
+        same tests as in global, but path=project/ instead of global=true, packages should be installed locally
+
+	Additionally, see issue #957 for testing that modifying the json spec with new packages installs the new packages
+'''
+
 import os
 try:
     import json
@@ -111,6 +167,7 @@ except ImportError:
     except ImportError:
         # Let snippet from module_utils/basic.py return a proper error in this case
         pass
+
 
 
 class Npm(object):
